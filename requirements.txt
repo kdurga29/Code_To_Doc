@@ -1,0 +1,16 @@
+tree-sitter
+tree-sitter-python
+tree-sitter-javascript
+langchain
+langchain-community
+langchain-huggingface
+langgraph
+langchain-text-splitters
+PyGithub
+pytest
+pytest-cov
+pytest-mock
+streamlit
+qdrant-client
+sentence-transformers
+python-dotenv
