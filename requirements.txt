@@ -13,4 +13,10 @@ pytest-mock
 streamlit
 qdrant-client
 sentence-transformers
+transformers
+torch
+accelerate
 python-dotenv
+fastapi
+uvicorn
+httpx

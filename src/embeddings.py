@@ -9,6 +9,7 @@ from typing import Any, TypedDict
 import importlib
 import os
 from dotenv import load_dotenv
+from qdrant_client import models
 
 load_dotenv()
 
@@ -29,6 +30,7 @@ except ImportError:
 
 
 DEFAULT_EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
+DEFAULT_DOCUMENTATION_MODEL = "deepseek-ai/deepseek-coder-1.3b-instruct"
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,13 @@ class EmbeddingRuntimeConfig:
     qdrant_collection_name: str = "code_to_doc_cst"
     qdrant_url: str | None = None
     qdrant_api_key: str | None = None
+    docs_model_name: str = DEFAULT_DOCUMENTATION_MODEL
+    docs_max_new_tokens: int = 512
+    docs_temperature: float = 0.1
+    docs_repetition_penalty: float = 1.1
+    docs_load_in_4bit: bool = True
+    docs_retrieval_limit: int = 8
+    docs_context_char_limit: int = 16_000
 
     @classmethod
     def from_env(cls) -> "EmbeddingRuntimeConfig":
@@ -49,7 +58,21 @@ class EmbeddingRuntimeConfig:
             qdrant_collection_name=os.getenv("QDRANT_COLLECTION_NAME", "code_to_doc_cst"),
             qdrant_url=os.getenv("QDRANT_URL"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY"),
+            docs_model_name=os.getenv("DOCUMENTATION_MODEL_NAME", DEFAULT_DOCUMENTATION_MODEL),
+            docs_max_new_tokens=int(os.getenv("DOCUMENTATION_MAX_NEW_TOKENS", "512")),
+            docs_temperature=float(os.getenv("DOCUMENTATION_TEMPERATURE", "0.1")),
+            docs_repetition_penalty=float(os.getenv("DOCUMENTATION_REPETITION_PENALTY", "1.1")),
+            docs_load_in_4bit=_env_flag("DOCUMENTATION_LOAD_IN_4BIT", default=True),
+            docs_retrieval_limit=int(os.getenv("DOCUMENTATION_RETRIEVAL_LIMIT", "8")),
+            docs_context_char_limit=int(os.getenv("DOCUMENTATION_CONTEXT_CHAR_LIMIT", "16000")),
         )
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass(frozen=True)
@@ -61,6 +84,18 @@ class CSTDocument:
     language: str
     cst: str
     metadata: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class RetrievedCSTDocument:
+    """Retrieved vector-store payload for downstream RAG generation."""
+
+    doc_id: str
+    path: str
+    language: str
+    cst: str
+    metadata: dict[str, Any]
+    score: float
 
 
 @dataclass(frozen=True)
@@ -191,25 +226,121 @@ class QdrantVectorStore:
 
         return ids
 
+    def repository_exists(self, repository: str, ref: str | None = None) -> bool:
+        if not self._collection_exists():
+            return False
+
+        client = self._get_client()
+        scroll_kwargs = {
+            "collection_name": self.collection_name,
+            "scroll_filter": self._build_repository_filter(repository, ref),
+            "limit": 1,
+            "with_payload": False,
+            "with_vectors": False,
+        }
+        try:
+            scroll_result = client.scroll(**scroll_kwargs)
+        except TypeError:
+            scroll_kwargs.pop("with_vectors", None)
+            scroll_result = client.scroll(**scroll_kwargs)
+        points = self._normalize_scroll_points(scroll_result)
+        return bool(points)
+
+    def search_repository_documents(
+        self,
+        repository: str,
+        ref: str | None,
+        query_vector: list[float],
+        limit: int = 8,
+    ) -> list[RetrievedCSTDocument]:
+        if not query_vector or not self._collection_exists():
+            return []
+
+        client = self._get_client()
+        query_filter = self._build_repository_filter(repository, ref)
+
+        if hasattr(client, "search"):
+            search_kwargs = {
+                "collection_name": self.collection_name,
+                "query_vector": query_vector,
+                "query_filter": query_filter,
+                "limit": limit,
+                "with_payload": True,
+                "with_vectors": False,
+            }
+            try:
+                result = client.search(**search_kwargs)
+            except TypeError:
+                search_kwargs.pop("with_vectors", None)
+                result = client.search(**search_kwargs)
+            points = list(result)
+        else:
+            query_kwargs = {
+                "collection_name": self.collection_name,
+                "query": query_vector,
+                "query_filter": query_filter,
+                "limit": limit,
+                "with_payload": True,
+                "with_vectors": False,
+            }
+            try:
+                result = client.query_points(**query_kwargs)
+            except TypeError:
+                query_kwargs.pop("with_vectors", None)
+                result = client.query_points(**query_kwargs)
+            points = list(getattr(result, "points", result))
+
+        return [self._to_retrieved_document(point) for point in points if getattr(point, "payload", None)]
+
     def _ensure_collection(self, vector_size: int) -> None:
         if self._collection_ready:
             return
 
         client = self._get_client()
-        collection_exists = getattr(client, "collection_exists", None)
-        exists = bool(collection_exists(self.collection_name)) if callable(collection_exists) else False
+        exists = self._collection_exists()
 
         if not exists:
-            models = self._get_models_module()
+            model = self._get_models_module()
             client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config=models.VectorParams(
+                vectors_config=model.VectorParams(
                     size=vector_size,
-                    distance=models.Distance.COSINE,
+                    distance=model.Distance.COSINE,
                 ),
+            )
+            client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="repository",
+                field_schema=models.PayloadSchemaType.KEYWORD,
+            )
+        
+            client.create_payload_index(
+                collection_name=self.collection_name,
+                field_name="ref",
+                field_schema=models.PayloadSchemaType.KEYWORD,
             )
 
         self._collection_ready = True
+
+    def _collection_exists(self) -> bool:
+        client = self._get_client()
+        collection_exists = getattr(client, "collection_exists", None)
+        if callable(collection_exists):
+            return bool(collection_exists(self.collection_name))
+
+        get_collections = getattr(client, "get_collections", None)
+        if not callable(get_collections):
+            return False
+
+        response = get_collections()
+        collections = getattr(response, "collections", response)
+        for collection in collections or []:
+            name = getattr(collection, "name", None)
+            if name is None and isinstance(collection, dict):
+                name = collection.get("name")
+            if name == self.collection_name:
+                return True
+        return False
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -231,6 +362,43 @@ class QdrantVectorStore:
 
         self._models_module = importlib.import_module("qdrant_client.models")
         return self._models_module
+
+    def _build_repository_filter(self, repository: str, ref: str | None) -> Any:
+        models = self._get_models_module()
+        ref_value = ref or "HEAD"
+        return models.Filter(
+            must=[
+                models.FieldCondition(
+                    key="repository",
+                    match=models.MatchValue(value=repository),
+                ),
+                models.FieldCondition(
+                    key="ref",
+                    match=models.MatchValue(value=ref_value),
+                ),
+            ]
+        )
+
+    @staticmethod
+    def _normalize_scroll_points(scroll_result: Any) -> list[Any]:
+        if isinstance(scroll_result, tuple):
+            return list(scroll_result[0])
+
+        points = getattr(scroll_result, "points", scroll_result)
+        return list(points)
+
+    @staticmethod
+    def _to_retrieved_document(point: Any) -> RetrievedCSTDocument:
+        payload = dict(getattr(point, "payload", {}) or {})
+        metadata = {key: value for key, value in payload.items() if key != "cst"}
+        return RetrievedCSTDocument(
+            doc_id=str(getattr(point, "id", "")),
+            path=str(payload.get("path", "")),
+            language=str(payload.get("language", "unknown")),
+            cst=str(payload.get("cst", "")),
+            metadata=metadata,
+            score=float(getattr(point, "score", 0.0) or 0.0),
+        )
 
 
 class RepositoryCSTEmbeddingIndexer:
